@@ -1,12 +1,22 @@
 import boto3
+import csv
+import io
 import logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-client = boto3.client('dynamodb')
+client = boto3.client('s3')
 
 def lambda_handler(event, context):
+
+    res_csvio = io.StringIO()
+    res_writer = csv.writer(res_csvio)
+    res_writer.writerow(['Restaurant id', 'Restaurant name', 'Country name', 'City name', 'User rating votes', 'User aggregate_rating', 'Cuisines'])
     
+    event_csvio = io.StringIO()
+    event_writer = csv.writer(event_csvio)
+    event_writer.writerow(['Event id', 'Restaurant id', 'Restaurant name', 'Photo url', 'Event title', 'Event start date', 'Event end date'])
+
     restaurant_count = 0
     event_count = 0
 
@@ -23,20 +33,8 @@ def lambda_handler(event, context):
                     logger.warning("skipped restaurant obj {} due to missing id...".format(res_json))
                     continue
                 res_id = res_json['id']
-                response = client.put_item(
-                    TableName='restaurant-table',
-                    Item = get_res_obj(res_json, res_id),
-                    ReturnValues = 'ALL_OLD'
-                )
-                statusCode = response['ResponseMetadata']['HTTPStatusCode']
-                if statusCode == 200:
-                    if "Attributes" in response:
-                        logger.warning("restaurant with id {} already exists, it is replaced with new object...".format(res_id))
-                    else:
-                        restaurant_count += 1
-                        # logger.info("successfully ingested restaurant with id {}, ingested {} restaurants so far...".format(res_id, restaurant_count))
-                else:
-                    logger.error("error ingesting restaurant with id {}".format(res_id))
+                res_writer.writerow(get_res_row(res_json, res_id))
+                restaurant_count += 1
                 
                 #for events
                 res_name = get_field_value(res_json, 'name', ("restaurant", res_id))
@@ -55,29 +53,28 @@ def lambda_handler(event, context):
 
                         #simple filter to check that both start and end dates are both in April 2017
                         if event_start_date == "NA" or event_end_date == "NA" or event_start_date < "2017-04-01" or event_end_date > "2017-04-30":
-                            logger.info("skipping event with id {} due to start date {} and end date {}...".format(event_id, event_start_date, event_end_date))
+                            # logger.info("skipping event with id {} due to start date {} and end date {}...".format(event_id, event_start_date, event_end_date))
                             continue
                             
-                        response = client.put_item(
-                            TableName='event-table',
-                            Item = get_event_obj(event_json, event_id, res_id, res_name),
-                            ReturnValues = 'ALL_OLD'
-                        )
-                        statusCode = response['ResponseMetadata']['HTTPStatusCode']
-                        if statusCode == 200:
-                            if "Attributes" in response:
-                                logger.warning("event with id {} already exists, it is replaced with new object...".format(event_id))
-                            else:
-                                event_count += 1
-                                # logger.info("successfully ingested event with id {}, ingested {} events so far...".format(event_id, event_count))
-                        else:
-                            logger.error("error ingesting event with id {}".format(event_id))
+                        event_writer.writerow(get_event_row(event_json, event_id, res_id, res_name))
+                        event_count += 1
     logger.info("end ingestion")
     logger.info("ingested {} restaurants and {} events".format(restaurant_count, event_count))
 
+    res_response = client.put_object(Body=res_csvio.getvalue(), ContentType='text/csv', Bucket='cc-interview-bucket', Key='restaurants.csv')
+    if res_response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        logger.info("successfully uploaded restaurants.csv to cc-interview-bucket")
+    else:
+        logger.error("failed to upload restaurants.csv")
+    event_response = client.put_object(Body=event_csvio.getvalue(), ContentType='text/csv', Bucket='cc-interview-bucket', Key='events.csv')
+    if event_response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        logger.info("successfully uploaded events.csv to cc-interview-bucket")
+    else:
+        logger.error("failed to upload events.csv")
+
     return "ingested {} restaurants and {} events".format(restaurant_count, event_count)
 
-def get_res_obj(res_json, res_id):
+def get_res_row(res_json, res_id):
     country_map = {
         1: "India",
         14: "Australia",
@@ -96,6 +93,8 @@ def get_res_obj(res_json, res_id):
         216: "United States"
     }
 
+    res_name = get_field_value(res_json, 'name', ("restaurant", res_id))
+
     country_id = get_field_value(get_field_value(res_json, 'location', ("restaurant", res_id)), 'country_id', ("restaurant", res_id))
     if country_id in country_map:
         country_name = country_map[country_id]
@@ -103,84 +102,32 @@ def get_res_obj(res_json, res_id):
         logger.warning("restaurant with id {} has invalid country code {}, using \"NA\" as country name...".format(res_id, country_id))
         country_name = "NA"
 
+    city_name = get_field_value(get_field_value(res_json, 'location', ("restaurant", res_id)), 'city', ("restaurant", res_id))
     user_rating_votes = get_field_value(get_field_value(res_json, 'user_rating', ("restaurant", res_id)), 'votes', ("restaurant", res_id))
-    if user_rating_votes == "NA":
-        user_rating_votes_obj = {
-            'S': user_rating_votes
-        }
-    else:
-        user_rating_votes_obj = {
-            'N': str(user_rating_votes)
-        }
-
     user_aggregate_rating = get_field_value(get_field_value(res_json, 'user_rating', ("restaurant", res_id)), 'aggregate_rating', ("restaurant", res_id))
-    if user_aggregate_rating == "NA":
-        user_aggregate_rating_obj = {
-            'S': user_aggregate_rating
-        }
-    else:
-        user_aggregate_rating_obj = {
-            'N': str(user_aggregate_rating)
-        }
+    cuisines = get_field_value(res_json, 'cuisines', ("restaurant", res_id))
 
-    return {
-        'Restaurant id': {
-            'S': res_id
-        },
-        'Restaurant name': {
-            'S': get_field_value(res_json, 'name', ("restaurant", res_id))
-        },
-        'Country name': {
-            'S': country_name
-        },
-        'City name': {
-            'S': get_field_value(get_field_value(res_json, 'location', ("restaurant", res_id)), 'city', ("restaurant", res_id))
-        },
-        'User rating votes': user_rating_votes_obj,
-        'User aggregate_rating': user_aggregate_rating_obj,
-        'Cuisines': {
-            'S': get_field_value(res_json, 'cuisines', ("restaurant", res_id))
-        }
-    }
+    return [res_id, res_name, country_name, city_name, user_rating_votes, user_aggregate_rating, cuisines]
 
-def get_event_obj(event_json, event_id, res_id, res_name):
+def get_event_row(event_json, event_id, res_id, res_name):
 
-    photo_urls = []
+    urls = []
     for photo in event_json.get('photos',[]):
         url = get_field_value(get_field_value(photo, 'photo', ("event", event_id)), 'url', ("event", event_id))
         if not url == "NA":
-            photo_urls.append(url)
+            urls.append(url)
 
-    if photo_urls:
-        photo_url_obj = {
-            'SS': photo_urls
-        }
+    if urls:
+        photo_url = urls
     else:
-        photo_url_obj = {
-            'S': "NA"
-        }
+        logger.info("event with id {} does not have photos, using \"NA\" as field value...".format(event_id))
+        photo_url = "NA"
 
-    return {
-        'Event id': {
-            'S': event_id
-        },
-        'Restaurant id': {
-            'S': res_id
-        },
-        'Restaurant name': {
-            'S': res_name
-        },
-        'Photo url': photo_url_obj,
-        'Event title': {
-            'S': get_field_value(event_json, 'title', ("event", event_id))
-        },
-        'Event start date': {
-            'S': get_field_value(event_json, 'start_date', ("event", event_id))
-        },
-        'Event end date': {
-            'S': get_field_value(event_json, 'end_date', ("event", event_id))
-        }
-    }
+    event_title = get_field_value(event_json, 'title', ("event", event_id))
+    event_start_date = get_field_value(event_json, 'start_date', ("event", event_id))
+    event_end_date = get_field_value(event_json, 'end_date', ("event", event_id))
+
+    return [event_id, res_id, res_name, photo_url, event_title, event_start_date, event_end_date]
 
 def get_field_value(json, field, id):
     if type(json) is dict and field in json:
